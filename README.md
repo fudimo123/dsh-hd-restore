@@ -1,7 +1,7 @@
 # hd-restore
 
-Batch **AI image upscaling** for [DeepSeek Harness](https://github.com/) — plus automatic
-**background fill for transparent PNGs**, in any colour you like.
+Batch **AI image upscaling** for [DeepSeek Harness](https://github.com/deepseek-ai) — plus
+automatic **background fill for transparent PNGs**, in any colour you like.
 
 Runs on **Real-ESRGAN (ncnn-Vulkan)**, so it uses your **GPU without CUDA**. Verified on an
 Intel Arc **integrated** GPU, so a discrete card is not required.
