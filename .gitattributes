@@ -1,0 +1,9 @@
+# Keep the bundled engine and model weights byte-exact
+*.exe   binary
+*.dll   binary
+*.bin   binary
+*.param binary
+
+# Normalise line endings for text
+*.ps1   text eol=crlf
+*.md    text eol=lf
