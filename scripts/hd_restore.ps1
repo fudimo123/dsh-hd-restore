@@ -53,6 +53,22 @@ param(
     [ValidateSet('anime', 'photo')]
     [string] $Model = 'anime',
 
+    # Upscaling method:
+    #   ai       - Real-ESRGAN, RECONSTRUCTS detail. Superb on art, but on fine
+    #              REGULAR textures (woven/knitted fabric, mesh, halftone) it can
+    #              hallucinate structure, and for ID photos / documents it may
+    #              alter the subject. See the README "when not to use AI".
+    #   faithful - deterministic resample (high-quality bicubic). Nothing is
+    #              invented; every output pixel derives from the input. Use this
+    #              for documents, ID photos, fine textures and archival copies.
+    [ValidateSet('ai', 'faithful')]
+    [string] $Method = 'ai',
+
+    # Only meaningful with -Method faithful. 0 = pure resample (safest).
+    # 0.3-0.6 adds a light unsharp-mask crisp-up; still fully deterministic.
+    [ValidateRange(0, 3)]
+    [double] $Unsharp = 0,
+
     # Background colour used to fill transparent areas.
     #   named : white, black, red, green, blue, gray/grey, transparent
     #   hex   : #RRGGBB   e.g. #FFFFFF
@@ -384,12 +400,97 @@ function Get-ImageInfo {
     finally { $i.Dispose() }
 }
 
+# Optional light unsharp mask for the faithful engine.
+#
+# Math:  out = orig * (1 + A) + blur * (-A)
+# The composite is built on a COPY of the original (not on the blurred layer),
+# otherwise only the blur would be drawn and the image would come out dimmed.
+# Still a pure per-pixel operation - nothing is invented.
+function Add-UnsharpMask {
+    param([System.Drawing.Bitmap] $Bmp, [double] $Amount)
+    $W = $Bmp.Width; $H = $Bmp.Height
+
+    # 1) low-pass copy of the original
+    $blur = New-Object System.Drawing.Bitmap($W, $H, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    try {
+        $tw = [Math]::Max(1, [int]($W / 4)); $th = [Math]::Max(1, [int]($H / 4))
+        $tmp = New-Object System.Drawing.Bitmap($tw, $th, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        try {
+            $gt = [System.Drawing.Graphics]::FromImage($tmp)
+            try { $gt.InterpolationMode = 'HighQualityBicubic'; $gt.DrawImage($Bmp, 0, 0, $tw, $th) } finally { $gt.Dispose() }
+            $gb = [System.Drawing.Graphics]::FromImage($blur)
+            try { $gb.InterpolationMode = 'HighQualityBicubic'; $gb.DrawImage($tmp, 0, 0, $W, $H) } finally { $gb.Dispose() }
+        } finally { $tmp.Dispose() }
+
+        # 2) working copy of the original, scaled by (1 + A)
+        $work = New-Object System.Drawing.Bitmap($W, $H, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        try {
+            $gw = [System.Drawing.Graphics]::FromImage($work)
+            try {
+                $gw.InterpolationMode = 'NearestNeighbor'
+                $gw.PixelOffsetMode = 'Half'
+                $cmUp = New-Object System.Drawing.Imaging.ColorMatrix
+                $cmUp.Matrix00 = 1 + $Amount; $cmUp.Matrix11 = 1 + $Amount; $cmUp.Matrix22 = 1 + $Amount
+                $cmUp.Matrix33 = 1.0
+                $aUp = New-Object System.Drawing.Imaging.ImageAttributes
+                $aUp.SetColorMatrix($cmUp)
+                $gw.DrawImage($Bmp, (New-Object System.Drawing.Rectangle(0, 0, $W, $H)),
+                              0, 0, $W, $H, [System.Drawing.GraphicsUnit]::Pixel, $aUp)
+                $aUp.Dispose()
+            } finally { $gw.Dispose() }
+
+            # 3) subtract A * blur from it, writing straight into the caller's bitmap
+            $cmDown = New-Object System.Drawing.Imaging.ColorMatrix
+            $cmDown.Matrix00 = 0.0; $cmDown.Matrix11 = 0.0; $cmDown.Matrix22 = 0.0; $cmDown.Matrix33 = 0.0
+            $cmDown.Matrix40 = -$Amount; $cmDown.Matrix41 = -$Amount; $cmDown.Matrix42 = -$Amount
+            $aDown = New-Object System.Drawing.Imaging.ImageAttributes
+            $aDown.SetColorMatrix($cmDown)
+
+            $g = [System.Drawing.Graphics]::FromImage($Bmp)
+            try {
+                $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceOver
+                $g.InterpolationMode = 'NearestNeighbor'
+                $g.PixelOffsetMode = 'Half'
+                $g.DrawImage($blur, (New-Object System.Drawing.Rectangle(0, 0, $W, $H)),
+                             0, 0, $W, $H, [System.Drawing.GraphicsUnit]::Pixel, $aDown)
+            } finally { $g.Dispose() }
+            $aDown.Dispose()
+        } finally { $work.Dispose() }
+    } finally { $blur.Dispose() }
+}
+
+# Deterministic upscale: every output pixel is a function of the input.
+function Save-FaithfulUpscale {
+    param([string] $InPath, [string] $OutPath, [int] $Factor, [double] $Amount)
+    $sim = [System.Drawing.Image]::FromFile($InPath)
+    try {
+        $W = [int][Math]::Round($sim.Width * $Factor)
+        $H = [int][Math]::Round($sim.Height * $Factor)
+        $cv = New-Object System.Drawing.Bitmap($W, $H, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        try {
+            $g = [System.Drawing.Graphics]::FromImage($cv)
+            try {
+                $g.Clear([System.Drawing.Color]::White)
+                $g.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+                $g.CompositingQuality = 'HighQuality'
+                $g.InterpolationMode = 'HighQualityBicubic'
+                $g.PixelOffsetMode = 'HighQuality'
+                $g.SmoothingMode = 'HighQuality'
+                $g.DrawImage($sim, (New-Object System.Drawing.Rectangle(0, 0, $W, $H)))
+            } finally { $g.Dispose() }
+            if ($Amount -gt 0) { Add-UnsharpMask -Bmp $cv -Amount $Amount }
+            $cv.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        } finally { $cv.Dispose() }
+    } finally { $sim.Dispose() }
+}
+
 # ------------------------------------------------------------------ run
 
 Write-Host "== hd-restore =="
-Write-Host "engine : $Engine"
-Write-Host "model  : $ModelName"
+Write-Host "method : $Method$(if ($Method -eq 'ai') { " (Real-ESRGAN)" } else { ' (deterministic resample)' })"
+if ($Method -eq 'ai') { Write-Host "model  : $ModelName" }
 Write-Host "scale  : $(if ($NoUpscale) { 'none (background pass only)' } else { "x$Scale" })"
+if ($Method -eq 'faithful' -and $Unsharp -gt 0) { Write-Host "unsharp: $Unsharp" }
 Write-Host "bg     : $($Bg.Label)"
 Write-Host "out    : $OutDirFull"
 Write-Host "input  : $($files.Count) image(s)"
@@ -415,6 +516,9 @@ foreach ($f in $files) {
         # that did not occur.
         $suffix = if ($NoUpscale) {
             if ($needsFill) { "_$($Bg.Label -replace '[^0-9A-Za-z]', '')_bg" } else { '_bg' }
+        } elseif ($Method -eq 'faithful') {
+            # mark the method so faithful and AI outputs never collide
+            "_x$Scale" + '_lanczos' + $(if ($needsFill) { '_' + ($Bg.Label -replace '[^0-9A-Za-z]', '') } else { '' })
         } else {
             "_x$Scale" + $(if ($needsFill) { '_' + ($Bg.Label -replace '[^0-9A-Za-z]', '') } else { '' })
         }
@@ -447,6 +551,16 @@ foreach ($f in $files) {
                 # already opaque -> normalise to plain 24bpp RGB
                 Save-OpaqueCopy -InPath $f.FullName -OutPath $final
             }
+        } elseif ($Method -eq 'faithful') {
+            # Deterministic path: background fill first (same reasoning as the AI
+            # path - give the resampler definite pixels at the edges), then resample.
+            $stage = 'faithful'
+            $seed = $f.FullName
+            if ($needsFill) {
+                $seed = Join-Path $WorkDir "flat$idx.png"
+                Save-Composited -InPath $f.FullName -OutPath $seed -Bg $Bg
+            }
+            Save-FaithfulUpscale -InPath $seed -OutPath $final -Factor $Scale -Amount $Unsharp
         } else {
             $stage = 'upscale'
             $big = Join-Path $WorkDir "big$idx.png"
@@ -500,7 +614,13 @@ foreach ($f in $files) {
         $size = (Get-Item -LiteralPath $final).Length
         $outInfo = Get-ImageInfo -Path $final
         $ok++
-        $tag = if ($needsFill) { "fill($($Bg.Label))+up" } else { 'opaque' }
+        $tag = if ($Method -eq 'faithful') {
+            if ($needsFill) { "fill($($Bg.Label))+lanczos" } else { 'lanczos' }
+        } elseif ($NoUpscale) {
+            if ($needsFill) { "fill($($Bg.Label)) only" } else { 'bg only' }
+        } else {
+            if ($needsFill) { "fill($($Bg.Label))+ai" } else { 'ai' }
+        }
         Write-Host ("  [{0,3}/{1}] {2,-46} {3,5} -> {4,-11} {5,7:N2} MB {6,6:N1}s  {7}" -f `
             $idx, $files.Count, $f.Name.Substring(0, [Math]::Min(46, $f.Name.Length)), `
             $srcInfo.Text, $outInfo.Text, ($size / 1MB), $secs, $tag)
